@@ -1,3 +1,6 @@
+"""
+An experimental baseline model for textual knowledge driven (multi-turn) dialogue
+"""
 from typing import Dict, List, Tuple
 
 import numpy
@@ -25,7 +28,7 @@ class MultiTurnHred(Model):
                  document_encoder: Seq2VecEncoder,
                  utterance_encoder: Seq2VecEncoder,
                  context_encoder: Seq2SeqEncoder,
-                 beam_size: int = None,
+                 beam_size: int = 2,
                  max_decoding_steps: int = 50,
                  scheduled_sampling_ratio: float = 0.,
                  use_bleu: bool = True) -> None:
@@ -44,22 +47,18 @@ class MultiTurnHred(Model):
             self._bleu = None
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
-        self._beam_size = beam_size or 1
+        self._beam_size = beam_size
         self._max_decoding_steps = max_decoding_steps
         self._beam_search = BeamSearch(self._end_index, max_steps=max_decoding_steps, beam_size=self._beam_size)
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
         self._max_decoding_steps = max_decoding_steps
-
         # Dense embedding of word level tokens.
         self._token_embedder = token_embedder
-
         # Document word level encoder.
         self._document_encoder = document_encoder
-
         # Dialogue word level encoder.
         self._utterance_encoder = utterance_encoder
-
         # Sentence level encoder.
         self._context_encoder = context_encoder
 
@@ -83,10 +82,13 @@ class MultiTurnHred(Model):
     @overrides
     def forward(self,  # type: ignore
                 document: Dict[str, torch.LongTensor],
-                dialogue: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
+                dialogue: Dict[str, torch.LongTensor]) -> Dict[str, torch.Tensor]:
         # pylint: disable=arguments-differ
         """
         Make foward pass with decoder logic for producing the entire target sequence.
+        For our experiment, an Instance should have a document field as background knowledge;
+        and a dialogue field which is a ListField stores history dialogues.
+        The model serves for experiments so we always have grounded target dialogue.
         """
         state = {}
         # shape: (batch_size, document_length, embedding_dim)
@@ -98,48 +100,48 @@ class MultiTurnHred(Model):
         state['document_vec'] = document_vec
 
         # training and validation
-        if dialogue is not None:
-            # shape: (batch_size, sequence_num, sequence_length, embedding_dim)
-            embedded_dialogue = self._token_embedder(dialogue)
-            # shape: (batch_size, sequence_num, sequence_length)
-            dialogue_mask = util.get_text_field_mask(dialogue, 1)
-            state['dialogue_mask'] = dialogue_mask
+        # shape: (batch_size, sequence_num, sequence_length, embedding_dim)
+        embedded_dialogue = self._token_embedder(dialogue)
+        # shape: (batch_size, sequence_num, sequence_length)
+        dialogue_mask = util.get_text_field_mask(dialogue, 1)
+        # We need dialogue_mask to compute masked cross entropy loss
+        state['dialogue_mask'] = dialogue_mask
 
-            batch_size, sequence_num, sequence_length = dialogue_mask.size()
+        batch_size, sequence_num, sequence_length = dialogue_mask.size()
 
-            # shape: (batch_size * sequence_num, utterance_output_dim)
-            utterance_vec = self._utterance_encoder(embedded_dialogue.
-                                                    view(batch_size * sequence_num, sequence_length, -1),
-                                                    dialogue_mask.view(batch_size * sequence_num, -1))
-            # shape: (batch_size, sequence_num, utterance_output_dim)
-            utterance_vec = utterance_vec.view(batch_size, sequence_num, -1)
-            # shape: (batch_size, sequence_num, context_output_dim)
-            context_vec = self._context_encoder(utterance_vec, dialogue_mask[:, :, 0])
-            # shape: (batch_size, sequence_num, utterance_output_dim)
-            decoder_hidden = torch.cat([utterance_vec.new_full((batch_size, 1, utterance_vec.size(-1)), fill_value=0.0),
-                                        utterance_vec[:, :-1, :]], dim=1).contiguous()
-            decoder_hidden = decoder_hidden.view(batch_size * sequence_num, -1)
-            # shape: (batch_size * sequence_num, utterance_output_dim)
+        # shape: (batch_size * sequence_num, utterance_output_dim)
+        utterance_vec = self._utterance_encoder(embedded_dialogue.
+                                                view(batch_size * sequence_num, sequence_length, -1),
+                                                dialogue_mask.view(batch_size * sequence_num, -1))
+        # shape: (batch_size, sequence_num, utterance_output_dim)
+        utterance_vec = utterance_vec.view(batch_size, sequence_num, -1)
+        # shape: (batch_size, sequence_num, context_output_dim)
+        context_vec = self._context_encoder(utterance_vec, dialogue_mask[:, :, 0])
+        # shape: (batch_size, sequence_num, utterance_output_dim)
+        decoder_hidden = torch.cat([utterance_vec.new_full((batch_size, 1, utterance_vec.size(-1)), fill_value=0.0),
+                                    utterance_vec[:, :-1, :]], dim=1).contiguous()
+        decoder_hidden = decoder_hidden.view(batch_size * sequence_num, -1)
+        # shape: (batch_size * sequence_num, utterance_output_dim)
+        state['decoder_hidden'] = decoder_hidden
+        # shape: (batch_size, sequence_num, encoder_output_dim)
+        # We reshape here to make it convenient to send to a torch GRUCell.
+        context_vec = torch.cat([context_vec.new_full((batch_size, 1, context_vec.size(-1)), fill_value=0.0),
+                                context_vec[:, :-1, :]], dim=1).contiguous()
+        # shape: (batch_size * sequence_num, encoder_output_dim)
+        context_vec = context_vec.view(batch_size * sequence_num, -1)
+        state['context_vec'] = context_vec
+        output_dict = self._forward_loop(state, dialogue)
+
+        if not self.training:
             state['decoder_hidden'] = decoder_hidden
-            # shape: (batch_size, sequence_num, encoder_output_dim)
-            # We reshape here to make it convenient to send to a torch GRUCell.
-            context_vec = torch.cat([context_vec.new_full((batch_size, 1, context_vec.size(-1)), fill_value=0.0),
-                                    context_vec[:, :-1, :]], dim=1).contiguous()
-            # shape: (batch_size * sequence_num, encoder_output_dim)
-            context_vec = context_vec.view(batch_size * sequence_num, -1)
-            state['context_vec'] = context_vec
-            output_dict = self._forward_loop(state, dialogue)
-
-            if not self.training:
-                state['decoder_hidden'] = decoder_hidden
-                predictions = self._forward_beam_search(state)
-                output_dict.update(predictions)
-                if self._bleu:
-                    # shape: (batch_size * sequence_num, beam_size, max_sequence_length)
-                    top_k_predictions = output_dict["predictions"].view(batch_size * sequence_num, self._beam_size, -1)
-                    # shape: (batch_size * sequence_num, max_predicted_sequence_length)
-                    best_predictions = top_k_predictions[:, 0, :]
-                    self._bleu(best_predictions, dialogue["tokens"].view(batch_size * sequence_num, -1))
+            predictions = self._forward_beam_search(state)
+            output_dict.update(predictions)
+            if self._bleu:
+                # shape: (batch_size * sequence_num, beam_size, max_sequence_length)
+                top_k_predictions = output_dict["predictions"].view(batch_size * sequence_num, self._beam_size, -1)
+                # shape: (batch_size * sequence_num, max_predicted_sequence_length)
+                best_predictions = top_k_predictions[:, 0, :]
+                self._bleu(best_predictions, dialogue["tokens"].view(batch_size * sequence_num, -1))
 
         return output_dict
 
@@ -183,8 +185,9 @@ class MultiTurnHred(Model):
                       dialogue: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
         # shape: (batch_size, sequence_num, sequence_length)
         targets = dialogue["tokens"]
-
         batch_size, sequence_num, sequence_length = targets.size()
+        # shape: (batch_size * sequence_num, sequence_length)
+        targets = targets.view(batch_size * sequence_num, -1)
         num_decoding_steps = sequence_length - 1
         # The last input from the target is either padding or the end symbol.
         # Either way, we don't have to process it.
@@ -192,19 +195,24 @@ class MultiTurnHred(Model):
         last_predictions = targets.new_full((batch_size * sequence_num,), fill_value=self._start_index)
         step_logits: List[torch.Tensor] = []
         step_predictions: List[torch.Tensor] = []
-        for timestep in range(num_decoding_steps):
-            # shape: (batch_size * sequence_num, num_classes)
-            output_projections, state = self._prepare_output_projections(last_predictions, state)
 
+        for timestep in range(num_decoding_steps):
+            if self.training and torch.rand(1).item() < self._scheduled_sampling_ratio:
+                # Use gold tokens at test time and at a rate of 1 - _scheduled_sampling_ratio
+                # during training.
+                # shape: (batch_size * sequence_num,)
+                input_choices = last_predictions
+            else:
+                # shape: (batch_size * sequence_num,)
+                input_choices = targets[:, timestep]
+            # shape: (batch_size * sequence_num, num_classes)
+            output_projections, state = self._prepare_output_projections(input_choices, state)
             # list of tensors, shape: (batch_size * sequence_num, 1, num_classes)
             step_logits.append(output_projections.unsqueeze(1))
-
             # shape: (batch_size * sequence_num, num_classes)
             class_probabilities = F.softmax(output_projections, dim=-1)
-
             # shape (predicted_classes): (batch_size * sequence_num,)
             _, predicted_classes = torch.max(class_probabilities, 1)
-
             # shape (predicted_classes): (batch_size * sequence_num,)
             last_predictions = predicted_classes
             # list of tensors, shape: (batch_size * sequence_num, 1)
@@ -212,16 +220,12 @@ class MultiTurnHred(Model):
 
         # shape: (batch_size * sequence_num, num_decoding_steps)
         predictions = torch.cat(step_predictions, 1)
-
         output_dict = {"predictions": predictions}
-
         # shape: (batch_size * sequence_num, num_decoding_steps, num_classes)
         logits = torch.cat(step_logits, 1)
-
         # Compute loss.
         # shape: (batch_size * sequence_num, sequence_length)
         target_mask = state["dialogue_mask"].view(batch_size * sequence_num, -1)
-        targets = targets.view(batch_size * sequence_num, -1)
         loss = self._get_loss(logits, targets, target_mask)
         output_dict["loss"] = loss
 
@@ -231,7 +235,6 @@ class MultiTurnHred(Model):
         """Make forward pass during prediction using a beam search."""
         batch_size, sequence_num, sequence_length = state["dialogue_mask"].size()
         start_predictions = state["dialogue_mask"].new_full((batch_size * sequence_num,), fill_value=self._start_index)
-
         # shape (all_top_k_predictions): (batch_size * sequence_num, beam_size, num_decoding_steps)
         # shape (log_probabilities): (batch_size * sequence_num, beam_size)
         all_top_k_predictions, log_probabilities = self._beam_search.search(
@@ -252,7 +255,6 @@ class MultiTurnHred(Model):
         """
         # shape: (batch_size * sequence_num, num_classes)
         output_projections, state = self._prepare_output_projections(last_predictions, state)
-
         # shape: (batch_size * sequence_num, num_classes)
         class_log_probabilities = F.log_softmax(output_projections, dim=-1)
 
@@ -278,9 +280,7 @@ class MultiTurnHred(Model):
         decoder_hidden = state['decoder_hidden']
         # shape: (batch_size * sequence_num, embedding_dim)
         decoder_hidden = self._decoder_cell(embedded_input, decoder_hidden)
-
         state['decoder_hidden'] = decoder_hidden
-
         # shape: (batch_size * sequence_num, num_classes)
         output_projections = self._output_projection_layer(decoder_hidden)
 
@@ -317,10 +317,8 @@ class MultiTurnHred(Model):
         """
         # shape: (batch_size * sequence_num, num_decoding_steps)
         relevant_targets = targets[:, 1:].contiguous()
-
         # shape: (batch_size * sequence_num, num_decoding_steps)
         relevant_mask = target_mask[:, 1:].contiguous()
-
         return util.sequence_cross_entropy_with_logits(logits, relevant_targets, relevant_mask)
 
     @overrides
