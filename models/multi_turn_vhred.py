@@ -12,15 +12,15 @@ from torch.nn.modules.rnn import GRUCell
 
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
 from allennlp.data.vocabulary import Vocabulary
-from allennlp.modules import TextFieldEmbedder, Seq2VecEncoder, Seq2SeqEncoder, TimeDistributed
+from allennlp.modules import TextFieldEmbedder, Seq2VecEncoder, Seq2SeqEncoder, TimeDistributed, FeedForward
 from allennlp.models.model import Model
 from allennlp.nn import util
 from allennlp.training.metrics import BLEU
 from allennlp_expand.nn.parallel_beam_search import ParallelBeamSearch
 
 
-@Model.register("multi_turn_hred")
-class MultiTurnHred(Model):
+@Model.register("multi_turn_vhred")
+class MultiTurnVhred(Model):
 
     def __init__(self,
                  vocab: Vocabulary,
@@ -32,7 +32,7 @@ class MultiTurnHred(Model):
                  max_decoding_steps: int = 50,
                  scheduled_sampling_ratio: float = 0.,
                  use_bleu: bool = True) -> None:
-        super(MultiTurnHred, self).__init__(vocab)
+        super(MultiTurnVhred, self).__init__(vocab)
         self._scheduled_sampling_ratio = scheduled_sampling_ratio
 
         # We need the start symbol to provide as the input at the first timestep of decoding, and
@@ -68,7 +68,12 @@ class MultiTurnHred(Model):
         utterance_output_dim = utterance_encoder.get_output_dim()
         context_output_dim = context_encoder.get_output_dim()
         decoder_output_dim = utterance_output_dim
-        decoder_input_dim = token_embedder.get_output_dim() + document_output_dim + context_output_dim
+        decoder_input_dim = token_embedder.get_output_dim() + document_output_dim + context_output_dim * 2
+
+        self._mean_encoder = TimeDistributed(FeedForward(context_output_dim, 3, context_output_dim,
+                                                         [torch.tanh, torch.tanh, lambda x: x], dropout=0.2))
+        self._var_encoder = TimeDistributed(FeedForward(context_output_dim, 3, context_output_dim,
+                                                        [torch.tanh, torch.tanh, lambda x: x], dropout=0.2))
 
         # We'll use an LSTM cell as the recurrent cell that produces a hidden state
         # for the decoder at each time step.
@@ -115,29 +120,45 @@ class MultiTurnHred(Model):
         utterance_vec = self._utterance_encoder(embedded_dialogue, dialogue_mask)
         # shape: (batch_size, sequence_num, context_output_dim)
         context_vec = self._context_encoder(utterance_vec, dialogue_mask[:, :, 0])
+        # shape: (batch_size, sequence_num, context_output_dim)
+        context_means = self._mean_encoder(context_vec)
+        context_vars = self._var_encoder(context_vec)
+
         # shape: (batch_size, target_sentence_num, utterance_output_dim)
         decoder_hidden = utterance_vec[:, :-1, :].contiguous()
         state['decoder_hidden'] = decoder_hidden
         # shape: (batch_size, target_sentence_num, context_output_dim)
         context_vec = context_vec[:, :-1, :].contiguous()
         state['context_vec'] = context_vec
-        output_dict = self._forward_loop(state, dialogue, dialogue_mask[:, 1:, :])
-        if not self.training:
+
+        if self.training:
+            prior_means = context_means[:, :-1, :].contiguous()
+            prior_vars = context_vars[:, :-1, :].contiguous()
+            post_means = context_means[:, 1:, :].contiguous()
+            post_vars = context_vars[:, 1:, :].contiguous()
+            state['latent_context'] = self._sampling(post_means, post_vars)
+            output_dict = self._forward_loop(state, dialogue, dialogue_mask[:, 1:, :])
+            output_dict['loss'] += self._get_kl_loss(prior_means, prior_vars, post_means, post_vars)
+        else:
+            prior_means = context_means[:, :-1, :].contiguous()
+            prior_vars = context_vars[:, :-1, :].contiguous()
+            # shape: (batch_size, target_sentence_num, context_output_dim)
+            state['latent_context'] = self._sampling(prior_means, prior_vars)
+            # Compute loss while validation and test
+            output_dict = self._forward_loop(state, dialogue, dialogue_mask[:, 1:, :])
+
             # shape: (batch_size, target_sentence_num, utterance_output_dim)
             state['decoder_hidden'] = decoder_hidden
             predictions = self._forward_beam_search(state)
             output_dict.update(predictions)
             if self._bleu:
                 # shape: (batch_size * target_sentence_num, beam_size, max_sequence_length)
-                top_k_predictions = output_dict["predictions"].view(batch_size * target_sentence_num, self._beam_size, -1)
+                top_k_predictions = output_dict["predictions"].view(batch_size * target_sentence_num, self._beam_size,
+                                                                    -1)
                 # shape: (batch_size * target_sentence_num, max_predicted_sequence_length)
                 best_predictions = top_k_predictions[:, 0, :]
                 self._bleu(best_predictions, dialogue["tokens"][:, 1:, :].reshape(batch_size * target_sentence_num, -1))
-        '''
-        if self._bleu:
-            predictions = output_dict['predictions'].view(batch_size * target_sentence_num, -1)
-            self._bleu(predictions, dialogue["tokens"][:, 1:, :].reshape(batch_size * target_sentence_num, -1))
-        '''
+
         return output_dict
 
     @overrides
@@ -152,10 +173,12 @@ class MultiTurnHred(Model):
         This method trims the output predictions to the first end symbol, replaces indices with
         corresponding tokens, and adds a field called ``predicted_tokens`` to the ``output_dict``.
         """
-        # shape: (batch_size, target_sentence_num, beam_size, num_decoding_steps)
+        # shape: (batch_size, sequence_num, beam_size, num_decoding_steps)
         predicted_indices = output_dict["predictions"]
+        # print(predicted_indices.size())
         if not isinstance(predicted_indices, numpy.ndarray):
             predicted_indices = predicted_indices.detach().cpu().numpy()
+        # print(predicted_indices.shape)
         all_predicted_tokens = []
         for instance_indices in predicted_indices:
             instance_predicted_tokens = []
@@ -171,6 +194,7 @@ class MultiTurnHred(Model):
                 predicted_tokens = [self.vocab.get_token_from_index(x)
                                     for x in indices_sequence]
                 instance_predicted_tokens.append(predicted_tokens)
+                # print(predicted_tokens)
         all_predicted_tokens.append(instance_predicted_tokens)
         output_dict["predicted_tokens"] = all_predicted_tokens
         return output_dict
@@ -271,9 +295,10 @@ class MultiTurnHred(Model):
         """
         context_vec = state['context_vec']
         batch_size, target_sentence_num, _ = context_vec.size()
-        # shape: (batch_size, target_sentence_num, embedding_dim + document_output_dim + context_output_dim)
+        # shape: (batch_size, target_sentence_num, embedding_dim + document_output_dim + context_output_dim * 2)
         embedded_input = torch.cat([self._token_embedder({'tokens': last_predictions}),
                                     state['document_vec'],
+                                    state['latent_context'],
                                     context_vec], dim=-1)
         # shape: (batch_size, target_sentence_num, decoder_output_dim)
         decoder_hidden = state['decoder_hidden']
@@ -282,6 +307,7 @@ class MultiTurnHred(Model):
         state['decoder_hidden'] = decoder_hidden
         # shape: (batch_size, target_sentence_num, num_classes)
         output_projections = self._output_projection_layer(decoder_hidden)
+
         return output_projections, state
 
     @staticmethod
@@ -327,3 +353,15 @@ class MultiTurnHred(Model):
         if self._bleu and not self.training:
             all_metrics.update(self._bleu.get_metric(reset=reset))
         return all_metrics
+
+    def _sampling(self, means, vars):
+        latent_context = torch.randn_like(means)
+        latent_context = means + latent_context * torch.sqrt(torch.exp(vars))
+        return latent_context
+
+    def _get_kl_loss(self, prior_means, prior_vars, post_means, post_vars):
+        batch_size = prior_means.size(0)
+        kl_loss = 0.5 * (prior_vars - post_vars +
+                         ((post_means - prior_means)**2 + torch.exp(post_vars)) / torch.exp(prior_vars))
+        kl_loss = torch.mean(kl_loss) / batch_size
+        return kl_loss
